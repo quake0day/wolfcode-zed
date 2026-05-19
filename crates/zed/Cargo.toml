@@ -1,5 +1,5 @@
 [package]
-description = "The fast, collaborative code editor."
+description = "WolfCode — AI-native programming education IDE (fork of Zed)."
 edition.workspace = true
 name = "zed"
 version = "1.4.0"
