@@ -9984,6 +9984,7 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "ui",
  "workspace",
  "zed_credentials_provider",
 ]
