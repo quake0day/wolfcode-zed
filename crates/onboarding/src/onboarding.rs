@@ -351,11 +351,11 @@ impl Render for Onboarding {
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        Headline::new("Welcome to WolfCode")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
-                                                        Label::new("The editor for what's next")
+                                                        Label::new("AI-native programming education — for students learning Python, Java, and beyond.")
                                                             .color(Color::Muted)
                                                             .size(LabelSize::Small)
                                                             .italic(),
