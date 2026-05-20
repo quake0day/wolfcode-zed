@@ -165,6 +165,7 @@ lesson_panel.workspace = true
 lesson_runner.workspace = true
 wolfcode_auth.workspace = true
 lesson_tutor.workspace = true
+lesson_telemetry.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 picker.workspace = true

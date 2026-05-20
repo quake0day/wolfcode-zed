@@ -153,6 +153,7 @@ members = [
     "crates/lesson_runner",
     "crates/wolfcode_auth",
     "crates/lesson_tutor",
+    "crates/lesson_telemetry",
     "crates/panel",
     "crates/paths",
     "crates/picker",
@@ -417,6 +418,7 @@ lesson_panel = { path = "crates/lesson_panel" }
 lesson_runner = { path = "crates/lesson_runner" }
 wolfcode_auth = { path = "crates/wolfcode_auth" }
 lesson_tutor = { path = "crates/lesson_tutor" }
+lesson_telemetry = { path = "crates/lesson_telemetry" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
 perf = { path = "tooling/perf" }

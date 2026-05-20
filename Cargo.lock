@@ -9949,6 +9949,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lesson_telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "credentials_provider",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "log",
+ "serde",
+ "serde_json",
+ "workspace",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "lesson_tutor"
 version = "0.1.0"
 dependencies = [
@@ -22606,6 +22622,7 @@ dependencies = [
  "languages",
  "lesson_panel",
  "lesson_runner",
+ "lesson_telemetry",
  "lesson_tutor",
  "line_ending_selector",
  "log",

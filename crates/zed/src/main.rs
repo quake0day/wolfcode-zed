@@ -747,6 +747,7 @@ fn main() {
         lesson_runner::init(cx);
         wolfcode_auth::init(cx);
         lesson_tutor::init(cx);
+        lesson_telemetry::init(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);
         channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
