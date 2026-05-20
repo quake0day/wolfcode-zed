@@ -26,6 +26,7 @@ use gpui::{
 use http_client::{AsyncBody, HttpClient, HttpClientWithUrl, Method, Request};
 use serde::Serialize;
 use ui::prelude::*;
+use ui::{Button, ButtonStyle};
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -302,7 +303,7 @@ impl Panel for TutorPanel {
     }
 
     fn starts_open(&self, _: &Window, _: &App) -> bool {
-        false
+        true
     }
 }
 
@@ -365,6 +366,38 @@ impl Render for TutorPanel {
             (PanelStatus::Error(e), _) => Label::new(e.clone()).color(Color::Error).into_any_element(),
         };
 
+        let ask_buttons = v_flex()
+            .gap_1()
+            .child(
+                Label::new("Ask again")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Button::new("tutor-l1", "💡  Hint Level 1 — where am I stuck?")
+                    .style(ButtonStyle::Filled)
+                    .full_width()
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(AskL1), cx);
+                    }),
+            )
+            .child(
+                Button::new("tutor-l2", "💡  Hint Level 2 — explain the concept")
+                    .style(ButtonStyle::Filled)
+                    .full_width()
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(AskL2), cx);
+                    }),
+            )
+            .child(
+                Button::new("tutor-l3", "💡  Hint Level 3 — pseudo-code / analogy")
+                    .style(ButtonStyle::Filled)
+                    .full_width()
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(AskL3), cx);
+                    }),
+            );
+
         v_flex()
             .key_context("TutorPanel")
             .id("tutor-panel")
@@ -373,6 +406,7 @@ impl Render for TutorPanel {
             .gap_3()
             .child(header)
             .child(context_line)
+            .child(ask_buttons)
             .child(body)
     }
 }

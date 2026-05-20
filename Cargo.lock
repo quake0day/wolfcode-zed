@@ -9925,6 +9925,8 @@ dependencies = [
  "editor",
  "gpui",
  "language",
+ "lesson_runner",
+ "lesson_tutor",
  "log",
  "project",
  "serde",
