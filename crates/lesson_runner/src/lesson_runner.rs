@@ -20,15 +20,22 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Result, anyhow};
 use collections::HashMap;
+use futures::AsyncReadExt as _;
 use gpui::{App, actions};
+use http_client::{AsyncBody, HttpClient, HttpClientWithUrl, Method, Request};
+use serde::Serialize;
 use task::{
     HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
 };
 use terminal_view::terminal_panel::TerminalPanel;
 use workspace::Workspace;
+
+const BFF_URL: &str = "https://wolfcode-bff.quake0day.workers.dev";
 
 const TRACE_PATH: &str = r"C:\Users\Quake\Projects\ai-editor\lesson-panel.trace";
 
@@ -111,6 +118,117 @@ fn build_test_command(
         vec!["-m".to_string(), "pytest".to_string(), name],
         parent,
     ))
+}
+
+/// Walk up from a lesson file to find a `course.json` and return
+/// (lesson_id_hint, course_id, relative_path_inside_course).
+fn derive_submission_context(path: &PathBuf) -> (String, String, String) {
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let lesson_id = filename
+        .strip_suffix(".test.py")
+        .or_else(|| filename.strip_suffix(".lesson.json"))
+        .or_else(|| filename.strip_suffix(".py"))
+        .unwrap_or(filename.as_str())
+        .to_string();
+
+    // Walk up looking for course.json, capped at 10 levels.
+    let mut dir = path.parent().map(|p| p.to_path_buf());
+    let mut course_root: Option<PathBuf> = None;
+    for _ in 0..10 {
+        let Some(d) = dir.clone() else {
+            break;
+        };
+        if d.join("course.json").exists() {
+            course_root = Some(d);
+            break;
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+
+    let (course_id, rel_path) = if let Some(root) = course_root {
+        let cid = read_course_id(&root.join("course.json")).unwrap_or_else(|| {
+            root.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+        let rel = path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| filename.clone());
+        (cid, rel)
+    } else {
+        ("unknown".to_string(), filename.clone())
+    };
+
+    (lesson_id, course_id, rel_path)
+}
+
+fn read_course_id(course_json: &PathBuf) -> Option<String> {
+    let bytes = std::fs::read(course_json).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("id")?.as_str().map(|s| s.to_string())
+}
+
+#[derive(Serialize)]
+struct SubmitBody<'a> {
+    content: &'a str,
+    course_id: &'a str,
+    file_path: &'a str,
+}
+
+async fn post_submission(
+    http: Arc<HttpClientWithUrl>,
+    jwt: &str,
+    lesson_id: &str,
+    course_id: &str,
+    rel_path: &str,
+    content: &str,
+) -> Result<String> {
+    let body = SubmitBody {
+        content,
+        course_id,
+        file_path: rel_path,
+    };
+    let payload = serde_json::to_string(&body)?;
+    let url = format!(
+        "{BFF_URL}/submissions/{}",
+        urlencoding_minimal(lesson_id)
+    );
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(&url)
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(payload))?;
+    let mut resp = http.send(req).await?;
+    let status = resp.status();
+    let mut reply = String::new();
+    resp.body_mut().read_to_string(&mut reply).await?;
+    if !status.is_success() {
+        return Err(anyhow!("/submissions returned {status}: {reply}"));
+    }
+    Ok(reply)
+}
+
+/// Tiny URL-encode for path components (avoids pulling in a urlencoding crate).
+/// Only encodes characters that would break a URL path segment.
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
+            _ => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn build_spawn_task(
@@ -247,17 +365,72 @@ pub fn init(cx: &mut App) {
             // TODO Z-W5: implement BFF tutor stream
         });
 
-        workspace.register_action(|workspace, _: &Submit, _window, cx| {
+        workspace.register_action(|workspace, _: &Submit, window, cx| {
             breadcrumb("Submit", "action invoked");
+            let http = workspace.app_state().client.http_client();
+            let cred = zed_credentials_provider::global(cx);
             let Some(path) = active_file_path(workspace, cx) else {
                 breadcrumb("Submit", "no active file -> noop");
                 return;
             };
+            let (lesson_id, course_id, rel_path) = derive_submission_context(&path);
             breadcrumb(
                 "Submit",
-                format!("would POST BFF /submissions for {}", path.display()),
+                format!(
+                    "lesson_id={lesson_id} course_id={course_id} rel_path={rel_path}"
+                ),
             );
-            // TODO Z-W7: implement BFF submission upload
+
+            window
+                .spawn(cx, async move |cx| {
+                    let read = match cred.read_credentials(BFF_URL, cx).await {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            breadcrumb("Submit", format!("keychain read FAILED: {e}"));
+                            return;
+                        }
+                    };
+                    let Some((_, jwt_bytes)) = read else {
+                        breadcrumb(
+                            "Submit",
+                            "no JWT in keychain (run SignInFromFile first)",
+                        );
+                        return;
+                    };
+                    let jwt = match String::from_utf8(jwt_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            breadcrumb("Submit", format!("JWT not UTF-8: {e}"));
+                            return;
+                        }
+                    };
+                    let content = match std::fs::read_to_string(&path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            breadcrumb("Submit", format!("read file FAILED: {e}"));
+                            return;
+                        }
+                    };
+                    breadcrumb(
+                        "Submit",
+                        format!("read content: {} bytes", content.len()),
+                    );
+
+                    match post_submission(
+                        http,
+                        &jwt,
+                        &lesson_id,
+                        &course_id,
+                        &rel_path,
+                        &content,
+                    )
+                    .await
+                    {
+                        Ok(reply) => breadcrumb("Submit", format!("OK: {reply}")),
+                        Err(e) => breadcrumb("Submit", format!("FAILED: {e}")),
+                    }
+                })
+                .detach();
         });
 
         breadcrumb("init", "4 actions registered (Run / Test / Explain / Submit)");

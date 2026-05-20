@@ -9939,13 +9939,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "credentials_provider",
  "editor",
+ "futures 0.3.32",
  "gpui",
+ "http_client",
  "log",
  "project",
+ "serde",
+ "serde_json",
  "task",
  "terminal_view",
  "workspace",
+ "zed_credentials_provider",
 ]
 
 [[package]]
