@@ -9938,10 +9938,13 @@ name = "lesson_runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
  "editor",
  "gpui",
  "log",
  "project",
+ "task",
+ "terminal_view",
  "workspace",
 ]
 

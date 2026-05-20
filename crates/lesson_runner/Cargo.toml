@@ -14,8 +14,11 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+collections.workspace = true
 editor.workspace = true
 gpui.workspace = true
 log.workspace = true
 project.workspace = true
+task.workspace = true
+terminal_view.workspace = true
 workspace.workspace = true
