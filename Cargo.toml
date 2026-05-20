@@ -150,6 +150,7 @@ members = [
     "crates/outline",
     "crates/outline_panel",
     "crates/lesson_panel",
+    "crates/lesson_runner",
     "crates/panel",
     "crates/paths",
     "crates/picker",
@@ -411,6 +412,7 @@ open_router = { path = "crates/open_router", features = ["schemars"] }
 outline = { path = "crates/outline" }
 outline_panel = { path = "crates/outline_panel" }
 lesson_panel = { path = "crates/lesson_panel" }
+lesson_runner = { path = "crates/lesson_runner" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
 perf = { path = "tooling/perf" }

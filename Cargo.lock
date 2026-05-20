@@ -9934,6 +9934,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lesson_runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "log",
+ "project",
+ "workspace",
+]
+
+[[package]]
 name = "libbz2-rs-sys"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22556,6 +22568,7 @@ dependencies = [
  "language_tools",
  "languages",
  "lesson_panel",
+ "lesson_runner",
  "line_ending_selector",
  "log",
  "markdown",
