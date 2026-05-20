@@ -213,6 +213,97 @@ async fn post_submission(
     Ok(reply)
 }
 
+/// Parse a pytest stdout summary line like:
+///   ===== 2 passed in 0.05s =====
+///   ===== 1 failed, 2 passed in 0.04s =====
+///   ===== 3 errors, 1 passed in 0.04s =====
+/// Returns (passed, failed). `failed` includes both "failed" and "errors".
+fn parse_pytest_summary(stdout: &str) -> (u32, u32) {
+    // Find the last "===== ... =====" line. pytest may emit multiple
+    // (e.g. for warnings); the summary is the last one.
+    let summary = stdout
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("=") && l.contains("passed") || l.contains("failed") || l.contains("error"))
+        .unwrap_or("");
+    let mut passed = 0u32;
+    let mut failed = 0u32;
+    // Scan for "<N> passed" / "<N> failed" / "<N> error(s)"
+    let tokens: Vec<&str> = summary.split_whitespace().collect();
+    for win in tokens.windows(2) {
+        let n: u32 = match win[0].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        match win[1] {
+            "passed" | "passed," => passed += n,
+            "failed" | "failed," => failed += n,
+            "error" | "errors" | "error," | "errors," => failed += n,
+            _ => {}
+        }
+    }
+    (passed, failed)
+}
+
+#[derive(Serialize)]
+struct EventBatchBody<'a> {
+    session_id: &'a str,
+    events: &'a [serde_json::Value],
+}
+
+async fn post_test_event(
+    http: Arc<HttpClientWithUrl>,
+    jwt: &str,
+    lesson_id: &str,
+    course_id: &str,
+    passed: u32,
+    failed: u32,
+    total: u32,
+) -> Result<String> {
+    let session_id = format!(
+        "test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let events = vec![serde_json::json!({
+        "ts": now,
+        "type": "test",
+        "lesson_id": lesson_id,
+        "course_id": course_id,
+        "kc": [],
+        "details": {
+            "command": "pytest",
+            "passed": passed,
+            "failed": failed,
+            "total": total,
+        }
+    })];
+    let payload = serde_json::to_string(&EventBatchBody {
+        session_id: &session_id,
+        events: &events,
+    })?;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{BFF_URL}/events/batch"))
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(payload))?;
+    let mut resp = http.send(req).await?;
+    let status = resp.status();
+    let mut body = String::new();
+    resp.body_mut().read_to_string(&mut body).await?;
+    if !status.is_success() {
+        return Err(anyhow!("/events/batch returned {status}: {body}"));
+    }
+    Ok(body)
+}
+
 /// Tiny URL-encode for path components (avoids pulling in a urlencoding crate).
 /// Only encodes characters that would break a URL path segment.
 fn urlencoding_minimal(s: &str) -> String {
@@ -311,6 +402,8 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &Test, window, cx| {
             breadcrumb("Test", "action invoked");
+            let http = workspace.app_state().client.http_client();
+            let cred = zed_credentials_provider::global(cx);
             let Some(path) = active_file_path(workspace, cx) else {
                 breadcrumb("Test", "no active file -> noop");
                 return;
@@ -322,33 +415,64 @@ pub fn init(cx: &mut App) {
                 );
                 return;
             };
-            let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) else {
-                breadcrumb("Test", "TerminalPanel unavailable");
-                return;
-            };
-            breadcrumb("Test", format!("spawning `{label}` in {}", cwd.display()));
-            let spawn_test = build_spawn_task(
-                "wolfcode-test",
-                &label,
-                &label,
-                command,
-                args,
-                cwd,
+            let (lesson_id, course_id, _rel_path) = derive_submission_context(&path);
+            breadcrumb(
+                "Test",
+                format!(
+                    "running `{label}` in {} (captured, will parse + post)",
+                    cwd.display()
+                ),
             );
+
             window.spawn(cx, async move |cx| {
-                breadcrumb("Test", "deferred: calling terminal_panel.spawn_task");
-                let result = terminal_panel.update_in(cx, |panel, window, cx| {
-                    panel.spawn_task(&spawn_test, window, cx)
-                });
-                match result {
-                    Ok(task) => {
-                        match task.await {
-                            Ok(_terminal) => breadcrumb("Test", "spawn_task succeeded"),
-                            Err(e) => breadcrumb("Test", format!("spawn_task failed: {e}")),
-                        }
+                // Run pytest as a captured child process. std::process::Command
+                // blocks the executor briefly while pytest runs (usually <2s for
+                // a single lesson). v0.2 will move this to a background thread.
+                let output = match std::process::Command::new(&command)
+                    .args(&args)
+                    .current_dir(&cwd)
+                    .output()
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        breadcrumb("Test", format!("spawn FAILED: {e}"));
+                        return;
                     }
-                    Err(e) => breadcrumb("Test", format!("update_in failed: {e}")),
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let exit_code = output.status.code().unwrap_or(-1);
+                breadcrumb(
+                    "Test",
+                    format!(
+                        "exit={exit_code} stdout={}B stderr={}B",
+                        stdout.len(),
+                        stderr.len()
+                    ),
+                );
+
+                let (passed, failed) = parse_pytest_summary(&stdout);
+                let total = passed + failed;
+                breadcrumb(
+                    "Test",
+                    format!("parsed: passed={passed} failed={failed} total={total}"),
+                );
+
+                // POST to BFF /events/batch (best-effort; auth required).
+                let read = cred.read_credentials(BFF_URL, cx).await.ok().flatten();
+                let Some((_, jwt_bytes)) = read else {
+                    breadcrumb("Test", "no JWT (skipping BFF event post)");
+                    return;
+                };
+                let Ok(jwt) = String::from_utf8(jwt_bytes) else {
+                    breadcrumb("Test", "JWT not UTF-8");
+                    return;
+                };
+                match post_test_event(http, &jwt, &lesson_id, &course_id, passed, failed, total).await {
+                    Ok(body) => breadcrumb("Test", format!("POST /events/batch OK: {body}")),
+                    Err(e) => breadcrumb("Test", format!("POST /events/batch FAILED: {e}")),
                 }
+                let _ = stderr; // silence unused
             }).detach();
         });
 
