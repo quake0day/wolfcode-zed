@@ -171,9 +171,24 @@ pub fn init(cx: &mut App) {
                 args,
                 cwd,
             );
-            terminal_panel
-                .update(cx, |panel, cx| panel.spawn_task(&spawn, window, cx))
-                .detach();
+            // Defer the spawn to after this action handler returns. The
+            // handler holds the workspace in update mode; spawn_task reads
+            // it internally and would double-lease.
+            window.spawn(cx, async move |cx| {
+                breadcrumb("Run", "deferred: calling terminal_panel.spawn_task");
+                let result = terminal_panel.update_in(cx, |panel, window, cx| {
+                    panel.spawn_task(&spawn, window, cx)
+                });
+                match result {
+                    Ok(task) => {
+                        match task.await {
+                            Ok(_terminal) => breadcrumb("Run", "spawn_task succeeded"),
+                            Err(e) => breadcrumb("Run", format!("spawn_task failed: {e}")),
+                        }
+                    }
+                    Err(e) => breadcrumb("Run", format!("update_in failed: {e}")),
+                }
+            }).detach();
         });
 
         workspace.register_action(|workspace, _: &Test, window, cx| {
@@ -194,7 +209,7 @@ pub fn init(cx: &mut App) {
                 return;
             };
             breadcrumb("Test", format!("spawning `{label}` in {}", cwd.display()));
-            let spawn = build_spawn_task(
+            let spawn_test = build_spawn_task(
                 "wolfcode-test",
                 &label,
                 &label,
@@ -202,9 +217,21 @@ pub fn init(cx: &mut App) {
                 args,
                 cwd,
             );
-            terminal_panel
-                .update(cx, |panel, cx| panel.spawn_task(&spawn, window, cx))
-                .detach();
+            window.spawn(cx, async move |cx| {
+                breadcrumb("Test", "deferred: calling terminal_panel.spawn_task");
+                let result = terminal_panel.update_in(cx, |panel, window, cx| {
+                    panel.spawn_task(&spawn_test, window, cx)
+                });
+                match result {
+                    Ok(task) => {
+                        match task.await {
+                            Ok(_terminal) => breadcrumb("Test", "spawn_task succeeded"),
+                            Err(e) => breadcrumb("Test", format!("spawn_task failed: {e}")),
+                        }
+                    }
+                    Err(e) => breadcrumb("Test", format!("update_in failed: {e}")),
+                }
+            }).detach();
         });
 
         workspace.register_action(|workspace, _: &Explain, _window, cx| {
