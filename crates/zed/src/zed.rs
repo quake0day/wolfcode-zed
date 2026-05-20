@@ -757,8 +757,17 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
+
+        // Z-W13: after all panels are attached, force-open the WolfCode
+        // Lesson + Tutor panels. starts_open(true) alone loses to the
+        // serialized dock state (and to the install-default Project panel
+        // owning the left dock activation), so we open them explicitly.
+        let _ = workspace_handle.update_in(&mut cx.clone(), |workspace, window, cx| {
+            workspace.open_panel::<lesson_panel::LessonPanel>(window, cx);
+            workspace.open_panel::<lesson_tutor::TutorPanel>(window, cx);
+        });
 
         anyhow::Ok(())
     })
