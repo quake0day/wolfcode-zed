@@ -22014,6 +22014,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wolfcode_auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "credentials_provider",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "log",
+ "serde",
+ "serde_json",
+ "workspace",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "workspace"
 version = "0.1.0"
 dependencies = [
@@ -22650,6 +22666,7 @@ dependencies = [
  "which_key",
  "windows 0.61.3",
  "windows_resources",
+ "wolfcode_auth",
  "workspace",
  "zed-reqwest",
  "zed_actions",
