@@ -28,7 +28,7 @@ use collections::HashMap;
 use futures::AsyncReadExt as _;
 use gpui::{App, actions};
 use http_client::{AsyncBody, HttpClient, HttpClientWithUrl, Method, Request};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use task::{
     HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
 };
@@ -238,15 +238,73 @@ async fn post_submission(
     Ok(reply)
 }
 
-/// Extract `"submission_id":"<value>"` from the BFF JSON reply.
-/// Cheap manual extraction so we don't have to introduce serde_json::from_str
-/// on a string we already log verbatim.
-fn parse_submission_id(json: &str) -> Option<String> {
-    let key = "\"submission_id\":\"";
-    let start = json.find(key)? + key.len();
-    let rest = &json[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+/// Z-W22: BFF /submissions/<id> reply shape — what the IDE cares about.
+#[derive(Debug, Default, Deserialize)]
+struct SubmitReply {
+    #[serde(default)]
+    submission_id: Option<String>,
+    #[serde(default)]
+    grade: Option<SubmitGrade>,
+}
+
+/// Authoritative grade from wolfcode-runner. Mirrors `grade` JSON written
+/// by submissions.ts. `error` is populated when grading itself failed
+/// (no test file in course_files, RUNNER down, etc.).
+#[derive(Debug, Default, Deserialize)]
+struct SubmitGrade {
+    #[serde(default)]
+    passed: Option<u32>,
+    #[serde(default)]
+    failed: Option<u32>,
+    #[serde(default)]
+    total: Option<u32>,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn parse_submit_reply(json: &str) -> SubmitReply {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+/// Compose the Submit success toast text from the parsed reply.
+/// Three cases: graded green / graded red / not graded (with reason).
+fn format_submit_toast(reply: &SubmitReply, bytes: usize, lesson_id: &str) -> String {
+    let id_short = reply
+        .submission_id
+        .as_deref()
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "?".to_string());
+
+    match reply.grade.as_ref() {
+        Some(g) if g.error.is_some() => {
+            // Submission accepted; grading itself failed. Surface why so
+            // the student doesn't think they passed when they didn't.
+            format!(
+                "✓ Submitted {bytes}B · id={id_short}… · ⚠ grade unavailable ({})",
+                g.error.as_deref().unwrap_or("?")
+            )
+        }
+        Some(g) if g.timed_out => format!(
+            "✓ Submitted {bytes}B · id={id_short}… · ⏱ test timed out — likely an infinite loop"
+        ),
+        Some(g) => match (g.passed, g.failed, g.total) {
+            (_, _, Some(0)) | (None, None, None) => format!(
+                "✓ Submitted {bytes}B · id={id_short}… · lesson={lesson_id} (no tests run)"
+            ),
+            (Some(p), Some(0), Some(t)) => {
+                format!("✓ Submitted · authoritative grade {p}/{t} ✅ · id={id_short}…")
+            }
+            (Some(p), Some(f), Some(t)) => format!(
+                "✗ Submitted but {f}/{t} failed · authoritative · {p} passed · id={id_short}…"
+            ),
+            _ => format!("✓ Submitted {bytes}B · id={id_short}… · lesson={lesson_id}"),
+        },
+        None => format!(
+            "✓ Submitted {bytes}B · id={id_short}… · lesson={lesson_id} (not graded)"
+        ),
+    }
 }
 
 /// Parse a pytest stdout summary line. Two formats are common:
@@ -876,15 +934,23 @@ pub fn init(cx: &mut App) {
                     {
                         Ok(reply) => {
                             breadcrumb("Submit", format!("OK: {reply}"));
-                            // Reply looks like: {"submission_id":"<uuid>", ...}
-                            let id_short = parse_submission_id(&reply)
-                                .map(|s| s.chars().take(8).collect::<String>())
-                                .unwrap_or_else(|| "?".to_string());
-                            push_toast(
+                            let parsed = parse_submit_reply(&reply);
+                            breadcrumb(
+                                "Submit",
                                 format!(
-                                    "✓ Submitted {bytes} bytes · id={id_short}… · lesson={lesson_id}"
-                                )
-                                .into(),
+                                    "parsed: id={} grade={}",
+                                    parsed.submission_id.as_deref().unwrap_or("none"),
+                                    parsed.grade.as_ref().map(|g| format!(
+                                        "{}p/{}f/{}t err={}",
+                                        g.passed.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                                        g.failed.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                                        g.total.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                                        g.error.as_deref().unwrap_or("none"),
+                                    )).unwrap_or_else(|| "none".to_string())
+                                ),
+                            );
+                            push_toast(
+                                format_submit_toast(&parsed, bytes, &lesson_id).into(),
                                 cx,
                             );
                             // Refresh lesson-status badges in outline tree.
