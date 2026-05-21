@@ -9922,8 +9922,11 @@ name = "lesson_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "credentials_provider",
  "editor",
+ "futures 0.3.32",
  "gpui",
+ "http_client",
  "language",
  "lesson_runner",
  "lesson_tutor",
@@ -9931,8 +9934,10 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "theme",
  "ui",
  "workspace",
+ "zed_credentials_provider",
 ]
 
 [[package]]
@@ -9946,6 +9951,7 @@ dependencies = [
  "futures 0.3.32",
  "gpui",
  "http_client",
+ "lesson_tutor",
  "log",
  "project",
  "serde",
