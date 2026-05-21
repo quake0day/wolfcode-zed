@@ -757,7 +757,11 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
+            // WolfCode: do NOT load Zed's Agent panel — its sign-in flow
+            // is Anthropic/Zed-cloud and would confuse students. Tutor lives
+            // in our own TutorPanel via the WolfCode BFF + kara-wiki.
+            // initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
+            futures::future::ready(()),
         );
 
         // Z-W13: after all panels are attached, force-open the WolfCode
