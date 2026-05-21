@@ -70,7 +70,10 @@ mod rewrap;
 mod selection;
 
 pub(crate) use actions::*;
-pub use clipboard::ClipboardSelection;
+pub use actions::PasteWasBlocked;
+pub use clipboard::{
+    ClipboardSelection, PasteRecord, drain_paste_log, is_paste_blocked, set_paste_blocked,
+};
 pub use code_actions::CodeActionProvider;
 pub use completions::CompletionProvider;
 #[cfg(test)]

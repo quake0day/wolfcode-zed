@@ -714,6 +714,9 @@ actions!(
         PageUp,
         /// Pastes from clipboard.
         Paste,
+        /// WolfCode: emitted when a paste is blocked because the active
+        /// lesson has `no_paste: true`. Listeners (Lesson Panel) show a toast.
+        PasteWasBlocked,
         /// Navigates to the previous edit prediction.
         PreviousEditPrediction,
         /// Goes to the previous snippet tabstop if one exists.

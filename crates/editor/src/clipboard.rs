@@ -1,5 +1,62 @@
 use super::*;
 
+static PASTE_BLOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// WolfCode (Z-W19a): set whether the current lesson blocks paste.
+/// Called by lesson_panel when the active lesson changes.
+pub fn set_paste_blocked(blocked: bool) {
+    PASTE_BLOCKED.store(blocked, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// WolfCode: query the current state, e.g. for rendering a 🔒 indicator.
+pub fn is_paste_blocked() -> bool {
+    PASTE_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// WolfCode (Z-W19c): every paste (success or blocked) leaves a record in
+/// this shared log. `lesson_runner` drains it on each Run/Test/Submit POST
+/// so the teacher dashboard sees paste behavior alongside execution events.
+#[derive(Clone, Debug)]
+pub struct PasteRecord {
+    pub ts_ms: u128,
+    pub bytes: usize,
+    pub lines: usize,
+    pub was_blocked: bool,
+}
+
+static PASTE_LOG: std::sync::OnceLock<std::sync::Mutex<Vec<PasteRecord>>> =
+    std::sync::OnceLock::new();
+
+fn paste_log() -> &'static std::sync::Mutex<Vec<PasteRecord>> {
+    PASTE_LOG.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Push a paste observation. Capped at 256 entries to avoid runaway growth
+/// if drain never runs — older entries fall off the front.
+pub fn record_paste(bytes: usize, lines: usize, was_blocked: bool) {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut g = paste_log().lock().unwrap();
+    if g.len() >= 256 {
+        g.remove(0);
+    }
+    g.push(PasteRecord {
+        ts_ms,
+        bytes,
+        lines,
+        was_blocked,
+    });
+}
+
+/// Drain and return all pending paste records (called by lesson_runner).
+pub fn drain_paste_log() -> Vec<PasteRecord> {
+    let mut g = paste_log().lock().unwrap();
+    std::mem::take(&mut *g)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClipboardSelection {
     /// The number of bytes in this selection.
@@ -244,10 +301,40 @@ impl Editor {
     }
 
     pub fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
+        // Read clipboard once so we can record + decide.
+        let item_opt = cx.read_from_clipboard();
+        // WolfCode (Z-W19c): always record paste behavior, even if blocked.
+        // Get (bytes, lines) from the clipboard string.
+        let (bytes, lines) = item_opt
+            .as_ref()
+            .and_then(|item| {
+                item.entries().iter().find_map(|e| match e {
+                    crate::ClipboardEntry::String(s) => {
+                        let text = s.text();
+                        Some((text.len(), text.matches('\n').count() + 1))
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or((0, 0));
+        let blocked = PASTE_BLOCKED.load(std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            record_paste(bytes, lines, blocked);
+        }
+        if blocked {
+            window.dispatch_action(Box::new(PasteWasBlocked), cx);
+            log::info!("editor::paste blocked by WolfCode lesson lock ({bytes}B, {lines} lines)");
+            return;
+        }
+        if let Some(item) = item_opt {
             self.paste_item(&item, window, cx);
         }
     }
+
+    // WolfCode (Z-W19a): per-process flag toggled by lesson_panel.
+    // Whenever the active lesson has `no_paste: true`, this is set true.
+    // `Editor::paste` short-circuits when set. Not buffer-scoped to keep
+    // the patch tiny — there's only one student/window per process.
 
     pub fn paste_item(
         &mut self,
