@@ -28,3 +28,5 @@ task.workspace = true
 terminal_view.workspace = true
 workspace.workspace = true
 zed_credentials_provider.workspace = true
+# Z-W15: stash the last pytest run + dispatch ExplainLastTestFailure.
+lesson_tutor = { path = "../lesson_tutor" }

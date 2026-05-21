@@ -34,6 +34,18 @@ use task::{
 };
 use terminal_view::terminal_panel::TerminalPanel;
 use workspace::Workspace;
+use workspace::pane::SaveIntent;
+use workspace::notifications::NotificationId;
+use workspace::Toast;
+
+// Toast markers (one per action so toasts replace each other rather than stack).
+struct SubmitToast;
+struct RunToast;
+struct TestToast;
+
+fn toast(msg: std::borrow::Cow<'static, str>, marker: NotificationId) -> Toast {
+    Toast::new(marker, msg).autohide()
+}
 
 const BFF_URL: &str = "https://wolfcode-bff.quake0day.workers.dev";
 
@@ -63,6 +75,10 @@ actions!(lesson_runner, [
     Explain,
     /// Submit the current lesson.
     Submit,
+    /// Z-W16: ping for the Lesson Panel to re-fetch /reports/me/lesson-status.
+    /// Declared here so lesson_runner can dispatch without depending on
+    /// lesson_panel (which would create a cycle).
+    RefreshLessonStatus,
 ]);
 
 /// Get the absolute path of the active editor's file, if any.
@@ -87,14 +103,23 @@ fn build_run_command(
     }
     let parent = path.parent()?.to_path_buf();
     let filename = path.file_name()?.to_string_lossy().to_string();
+    // Pack the entire command into the `command` field with EMPTY args.
+    // Zed's prepare_task_for_spawn computes command_label from `task.command`
+    // alone (ignoring `task.args`), so passing args separately produces a
+    // misleading label like `pwsh -C 'python'`. Inlining the args keeps the
+    // displayed label correct.
+    let full = format!("python {filename}");
     Some((
-        format!("python {filename}"),
-        "python".to_string(),
-        vec![filename],
+        full.clone(),
+        full,
+        Vec::new(),
         parent,
     ))
 }
 
+// Test uses std::process::Command directly (NOT the terminal), so it needs
+// separate command+args (otherwise Command::new("python -m pytest ...") would
+// look for a literal binary by that name).
 fn build_test_command(
     path: &PathBuf,
 ) -> Option<(String, String, Vec<String>, PathBuf)> {
@@ -213,18 +238,33 @@ async fn post_submission(
     Ok(reply)
 }
 
-/// Parse a pytest stdout summary line like:
-///   ===== 2 passed in 0.05s =====
-///   ===== 1 failed, 2 passed in 0.04s =====
-///   ===== 3 errors, 1 passed in 0.04s =====
+/// Extract `"submission_id":"<value>"` from the BFF JSON reply.
+/// Cheap manual extraction so we don't have to introduce serde_json::from_str
+/// on a string we already log verbatim.
+fn parse_submission_id(json: &str) -> Option<String> {
+    let key = "\"submission_id\":\"";
+    let start = json.find(key)? + key.len();
+    let rest = &json[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse a pytest stdout summary line. Two formats are common:
+///   • TTY mode:     `===== 2 passed in 0.05s =====`
+///   • non-TTY mode: `2 passed in 0.05s`  (no equals wrapping — what we get
+///                    when run via std::process::Command).
 /// Returns (passed, failed). `failed` includes both "failed" and "errors".
 fn parse_pytest_summary(stdout: &str) -> (u32, u32) {
-    // Find the last "===== ... =====" line. pytest may emit multiple
-    // (e.g. for warnings); the summary is the last one.
+    // The summary line is the LAST non-empty line. pytest always prints
+    // exactly one final summary line regardless of TTY mode.
     let summary = stdout
         .lines()
         .rev()
-        .find(|l| l.starts_with("=") && l.contains("passed") || l.contains("failed") || l.contains("error"))
+        .find(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && (t.contains("passed") || t.contains("failed") || t.contains("error"))
+        })
         .unwrap_or("");
     let mut passed = 0u32;
     let mut failed = 0u32;
@@ -251,6 +291,104 @@ struct EventBatchBody<'a> {
     events: &'a [serde_json::Value],
 }
 
+/// Z-W19c: drain editor's paste log and POST each as a `paste` event.
+/// Piggy-backs on the existing /events/batch infrastructure.
+async fn flush_paste_log(
+    http: Arc<HttpClientWithUrl>,
+    jwt: &str,
+    lesson_id: &str,
+    course_id: &str,
+) -> Result<usize> {
+    let records = editor::drain_paste_log();
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let events: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "ts": r.ts_ms as u64,
+                "type": "paste",
+                "lesson_id": lesson_id,
+                "course_id": course_id,
+                "kc": [],
+                "details": {
+                    "bytes": r.bytes,
+                    "lines": r.lines,
+                    "blocked": r.was_blocked,
+                }
+            })
+        })
+        .collect();
+    let session_id = format!("paste-{}", records[0].ts_ms);
+    let payload = serde_json::to_string(&EventBatchBody {
+        session_id: &session_id,
+        events: &events,
+    })?;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{BFF_URL}/events/batch"))
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(payload))?;
+    let mut resp = http.send(req).await?;
+    let status = resp.status();
+    let mut body = String::new();
+    resp.body_mut().read_to_string(&mut body).await?;
+    if !status.is_success() {
+        return Err(anyhow!("/events/batch (paste flush) returned {status}: {body}"));
+    }
+    breadcrumb(
+        "flush_paste_log",
+        format!("flushed {} paste records", records.len()),
+    );
+    Ok(records.len())
+}
+
+async fn post_run_event(
+    http: Arc<HttpClientWithUrl>,
+    jwt: &str,
+    lesson_id: &str,
+    course_id: &str,
+    command: &str,
+    code: Option<&str>,
+) -> Result<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let session_id = format!("run-{now}");
+    let events = vec![serde_json::json!({
+        "ts": now,
+        "type": "run",
+        "lesson_id": lesson_id,
+        "course_id": course_id,
+        "kc": [],
+        "details": {
+            "command": command,
+            "code": code,
+        }
+    })];
+    let payload = serde_json::to_string(&EventBatchBody {
+        session_id: &session_id,
+        events: &events,
+    })?;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{BFF_URL}/events/batch"))
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(payload))?;
+    let mut resp = http.send(req).await?;
+    let status = resp.status();
+    let mut body = String::new();
+    resp.body_mut().read_to_string(&mut body).await?;
+    if !status.is_success() {
+        return Err(anyhow!("/events/batch returned {status}: {body}"));
+    }
+    Ok(body)
+}
+
 async fn post_test_event(
     http: Arc<HttpClientWithUrl>,
     jwt: &str,
@@ -259,6 +397,7 @@ async fn post_test_event(
     passed: u32,
     failed: u32,
     total: u32,
+    code: Option<&str>,
 ) -> Result<String> {
     let session_id = format!(
         "test-{}",
@@ -282,6 +421,7 @@ async fn post_test_event(
             "passed": passed,
             "failed": failed,
             "total": total,
+            "code": code,
         }
     })];
     let payload = serde_json::to_string(&EventBatchBody {
@@ -359,18 +499,37 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &Run, window, cx| {
             breadcrumb("Run", "action invoked");
+            workspace.save_active_item(SaveIntent::Save, window, cx).detach();
+
+            let http = workspace.app_state().client.http_client();
+            let cred = zed_credentials_provider::global(cx);
+
             let Some(path) = active_file_path(workspace, cx) else {
                 breadcrumb("Run", "no active file -> noop");
+                workspace.show_toast(
+                    toast("Open a Python lesson file before pressing Run.".into(), NotificationId::unique::<RunToast>()),
+                    cx,
+                );
                 return;
             };
             let Some((label, command, args, cwd)) = build_run_command(&path) else {
                 breadcrumb("Run", format!("not runnable: {}", path.display()));
+                workspace.show_toast(
+                    toast(format!("Can't Run this file: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).into(), NotificationId::unique::<RunToast>()),
+                    cx,
+                );
                 return;
             };
+            let (lesson_id, course_id, _rel) = derive_submission_context(&path);
+            let path_for_run_event = path.clone();
             let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) else {
                 breadcrumb("Run", "TerminalPanel unavailable");
                 return;
             };
+            workspace.show_toast(
+                toast(format!("▶ Running {label} in terminal…").into(), NotificationId::unique::<RunToast>()),
+                cx,
+            );
             breadcrumb("Run", format!("spawning `{label}` in {}", cwd.display()));
             let spawn = build_spawn_task(
                 "wolfcode-run",
@@ -383,11 +542,43 @@ pub fn init(cx: &mut App) {
             // Defer the spawn to after this action handler returns. The
             // handler holds the workspace in update mode; spawn_task reads
             // it internally and would double-lease.
+            // Capture the file content NOW so the event reflects what was run.
+            let code_for_run = std::fs::read_to_string(&path_for_run_event).ok();
+            let label_for_run = label.clone();
+
             window.spawn(cx, async move |cx| {
                 breadcrumb("Run", "deferred: calling terminal_panel.spawn_task");
                 let result = terminal_panel.update_in(cx, |panel, window, cx| {
                     panel.spawn_task(&spawn, window, cx)
                 });
+
+                // POST a run event (with code snapshot) to BFF for the
+                // teacher dashboard. Best-effort; failures don't surface.
+                let read = cred.read_credentials(BFF_URL, cx).await.ok().flatten();
+                if let Some((_, jwt_bytes)) = read
+                    && let Ok(jwt) = String::from_utf8(jwt_bytes)
+                {
+                    match post_run_event(
+                        http.clone(),
+                        &jwt,
+                        &lesson_id,
+                        &course_id,
+                        &label_for_run,
+                        code_for_run.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(body) => breadcrumb("Run", format!("POST /events/batch OK: {body}")),
+                        Err(e) => breadcrumb("Run", format!("POST /events/batch FAILED: {e}")),
+                    }
+                    // Drain any pasted text that accumulated.
+                    if let Err(e) = flush_paste_log(http, &jwt, &lesson_id, &course_id).await {
+                        breadcrumb("Run", format!("flush_paste_log FAILED: {e}"));
+                    }
+                } else {
+                    breadcrumb("Run", "no JWT — skipping event POST");
+                }
+
                 match result {
                     Ok(task) => {
                         match task.await {
@@ -402,6 +593,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &Test, window, cx| {
             breadcrumb("Test", "action invoked");
+            workspace.save_active_item(SaveIntent::Save, window, cx).detach();
             let http = workspace.app_state().client.http_client();
             let cred = zed_credentials_provider::global(cx);
             let Some(path) = active_file_path(workspace, cx) else {
@@ -416,15 +608,48 @@ pub fn init(cx: &mut App) {
                 return;
             };
             let (lesson_id, course_id, _rel_path) = derive_submission_context(&path);
+            let workspace_weak = cx.entity().downgrade();
             breadcrumb(
                 "Test",
                 format!(
-                    "running `{label}` in {} (captured, will parse + post)",
+                    "running `{label}` in {} (captured + visible)",
                     cwd.display()
                 ),
             );
 
+            // ALSO spawn pytest in the terminal panel so the student sees
+            // the full pass/fail trace, not just a count. The captured
+            // child below produces the toast + telemetry; this terminal
+            // spawn is purely for visibility.
+            if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
+                // Build a verbose `python -m pytest -v <name>` task — flat
+                // command string so Zed's command label renders correctly.
+                let test_name = args.last().cloned().unwrap_or_default();
+                let visible_label = format!("python -m pytest -v {test_name}");
+                let visible_spawn = build_spawn_task(
+                    "wolfcode-test-visible",
+                    &visible_label,
+                    &visible_label,
+                    visible_label.clone(),
+                    Vec::new(),
+                    cwd.clone(),
+                );
+                let weak_terminal = terminal_panel.downgrade();
+                window.spawn(cx, async move |cx| {
+                    let _ = weak_terminal.update_in(cx, |panel, window, cx| {
+                        panel.spawn_task(&visible_spawn, window, cx).detach();
+                    });
+                }).detach();
+            }
+
             window.spawn(cx, async move |cx| {
+                let push_toast = |msg: std::borrow::Cow<'static, str>,
+                                   cx: &mut gpui::AsyncWindowContext| {
+                    let _ = workspace_weak.update(cx, |ws, cx| {
+                        ws.show_toast(toast(msg, NotificationId::unique::<TestToast>()), cx);
+                    });
+                };
+
                 // Run pytest as a captured child process. std::process::Command
                 // blocks the executor briefly while pytest runs (usually <2s for
                 // a single lesson). v0.2 will move this to a background thread.
@@ -436,20 +661,23 @@ pub fn init(cx: &mut App) {
                     Ok(o) => o,
                     Err(e) => {
                         breadcrumb("Test", format!("spawn FAILED: {e}"));
+                        push_toast(format!("Test failed: couldn't run pytest — {e}").into(), cx);
                         return;
                     }
                 };
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let _stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 let exit_code = output.status.code().unwrap_or(-1);
                 breadcrumb(
                     "Test",
                     format!(
                         "exit={exit_code} stdout={}B stderr={}B",
                         stdout.len(),
-                        stderr.len()
+                        _stderr.len()
                     ),
                 );
+                // Dump the actual stdout content so we can diagnose parse failures.
+                breadcrumb("Test", format!("stdout_dump: {}", stdout.replace('\n', " ¶ ")));
 
                 let (passed, failed) = parse_pytest_summary(&stdout);
                 let total = passed + failed;
@@ -457,6 +685,71 @@ pub fn init(cx: &mut App) {
                     "Test",
                     format!("parsed: passed={passed} failed={failed} total={total}"),
                 );
+                // Toast result.
+                if total == 0 {
+                    push_toast(
+                        format!("Test ran (exit {exit_code}) but no pass/fail summary found. Check the file pattern.").into(),
+                        cx,
+                    );
+                } else if failed == 0 {
+                    push_toast(format!("✓ All {passed} test{} passed!", if passed == 1 { "" } else { "s" }).into(), cx);
+                    // Wipe stale failure state from any previous run.
+                    lesson_tutor::clear_test_run();
+                    let lesson_id_clone = lesson_id.clone();
+                    let _ = workspace_weak.update_in(cx, |ws, window, cx| {
+                        if let Some(panel) = ws.panel::<lesson_tutor::TutorPanel>(cx) {
+                            panel.update(cx, |p, cx| p.celebrate_test_pass(lesson_id_clone, passed, cx));
+                        }
+                        // Refresh lesson-status badges in outline tree.
+                        window.dispatch_action(Box::new(RefreshLessonStatus), cx);
+                    });
+                } else {
+                    push_toast(
+                        format!("✗ {failed} failed / {passed} passed (of {total}) — click 💡 in Tutor for an explanation").into(),
+                        cx,
+                    );
+
+                    // Z-W15: stash pytest output for AI explanation + dispatch.
+                    // Resolve student .py path (path may be the .test.py if
+                    // student had it open; we want the student's code file).
+                    let path_str = path.to_string_lossy().to_string();
+                    let student_path = if path_str.ends_with(".test.py") {
+                        let stem = path_str.trim_end_matches(".test.py").to_string();
+                        PathBuf::from(format!("{stem}.py"))
+                    } else {
+                        path.clone()
+                    };
+                    let test_path = if path_str.ends_with(".test.py") {
+                        path.clone()
+                    } else {
+                        let stem = path_str.trim_end_matches(".py").to_string();
+                        PathBuf::from(format!("{stem}.test.py"))
+                    };
+                    let student_code = std::fs::read_to_string(&student_path).unwrap_or_default();
+                    let test_code = std::fs::read_to_string(&test_path).ok();
+                    let snap = lesson_tutor::TestRunSnapshot {
+                        lesson_id: lesson_id.clone(),
+                        student_code,
+                        student_filename: student_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        test_code,
+                        test_filename: Some(
+                            test_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        ),
+                        test_output: stdout.clone(),
+                        exit_code,
+                    };
+                    lesson_tutor::stash_test_run(snap);
+                    breadcrumb("Test", "stashed test run; dispatching ExplainLastTestFailure");
+                    let _ = workspace_weak.update_in(cx, |_, window, cx| {
+                        window.dispatch_action(Box::new(lesson_tutor::ExplainLastTestFailure), cx);
+                    });
+                }
 
                 // POST to BFF /events/batch (best-effort; auth required).
                 let read = cred.read_credentials(BFF_URL, cx).await.ok().flatten();
@@ -468,11 +761,24 @@ pub fn init(cx: &mut App) {
                     breadcrumb("Test", "JWT not UTF-8");
                     return;
                 };
-                match post_test_event(http, &jwt, &lesson_id, &course_id, passed, failed, total).await {
+                // Capture code snapshot for the dashboard. Read from disk
+                // (file was auto-saved at the top of Test).
+                let path_for_code = {
+                    let s = path.to_string_lossy().to_string();
+                    if s.ends_with(".test.py") {
+                        PathBuf::from(s.trim_end_matches(".test.py").to_string() + ".py")
+                    } else {
+                        path.clone()
+                    }
+                };
+                let code_for_event = std::fs::read_to_string(&path_for_code).ok();
+                match post_test_event(http.clone(), &jwt, &lesson_id, &course_id, passed, failed, total, code_for_event.as_deref()).await {
                     Ok(body) => breadcrumb("Test", format!("POST /events/batch OK: {body}")),
                     Err(e) => breadcrumb("Test", format!("POST /events/batch FAILED: {e}")),
                 }
-                let _ = stderr; // silence unused
+                if let Err(e) = flush_paste_log(http, &jwt, &lesson_id, &course_id).await {
+                    breadcrumb("Test", format!("flush_paste_log FAILED: {e}"));
+                }
             }).detach();
         });
 
@@ -491,8 +797,10 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &Submit, window, cx| {
             breadcrumb("Submit", "action invoked");
+            workspace.save_active_item(SaveIntent::Save, window, cx).detach();
             let http = workspace.app_state().client.http_client();
             let cred = zed_credentials_provider::global(cx);
+            let workspace_weak = cx.entity().downgrade();
             let Some(path) = active_file_path(workspace, cx) else {
                 breadcrumb("Submit", "no active file -> noop");
                 return;
@@ -507,17 +815,28 @@ pub fn init(cx: &mut App) {
 
             window
                 .spawn(cx, async move |cx| {
+                    // Helper to show a toast back on the workspace (UI feedback).
+                    let toast_id = || NotificationId::unique::<SubmitToast>();
+                    let push_toast = |msg: std::borrow::Cow<'static, str>,
+                                       cx: &mut gpui::AsyncWindowContext| {
+                        let _ = workspace_weak.update(cx, |ws, cx| {
+                            ws.show_toast(toast(msg, toast_id()), cx);
+                        });
+                    };
+
                     let read = match cred.read_credentials(BFF_URL, cx).await {
                         Ok(opt) => opt,
                         Err(e) => {
                             breadcrumb("Submit", format!("keychain read FAILED: {e}"));
+                            push_toast(format!("Submit failed: keychain — {e}").into(), cx);
                             return;
                         }
                     };
                     let Some((_, jwt_bytes)) = read else {
-                        breadcrumb(
-                            "Submit",
-                            "no JWT in keychain (run SignInFromFile first)",
+                        breadcrumb("Submit", "no JWT in keychain (run SignInFromFile first)");
+                        push_toast(
+                            "Not signed in. Run `WolfCode: Sign In From File` first.".into(),
+                            cx,
                         );
                         return;
                     };
@@ -525,6 +844,7 @@ pub fn init(cx: &mut App) {
                         Ok(s) => s,
                         Err(e) => {
                             breadcrumb("Submit", format!("JWT not UTF-8: {e}"));
+                            push_toast(format!("Submit failed: bad JWT — {e}").into(), cx);
                             return;
                         }
                     };
@@ -532,14 +852,18 @@ pub fn init(cx: &mut App) {
                         Ok(s) => s,
                         Err(e) => {
                             breadcrumb("Submit", format!("read file FAILED: {e}"));
+                            push_toast(format!("Submit failed: couldn't read file — {e}").into(), cx);
                             return;
                         }
                     };
-                    breadcrumb(
-                        "Submit",
-                        format!("read content: {} bytes", content.len()),
-                    );
+                    let bytes = content.len();
+                    breadcrumb("Submit", format!("read content: {} bytes", bytes));
 
+                    // Flush pastes BEFORE submit so they're recorded under
+                    // this lesson rather than the next one the student opens.
+                    if let Err(e) = flush_paste_log(http.clone(), &jwt, &lesson_id, &course_id).await {
+                        breadcrumb("Submit", format!("flush_paste_log FAILED: {e}"));
+                    }
                     match post_submission(
                         http,
                         &jwt,
@@ -550,8 +874,28 @@ pub fn init(cx: &mut App) {
                     )
                     .await
                     {
-                        Ok(reply) => breadcrumb("Submit", format!("OK: {reply}")),
-                        Err(e) => breadcrumb("Submit", format!("FAILED: {e}")),
+                        Ok(reply) => {
+                            breadcrumb("Submit", format!("OK: {reply}"));
+                            // Reply looks like: {"submission_id":"<uuid>", ...}
+                            let id_short = parse_submission_id(&reply)
+                                .map(|s| s.chars().take(8).collect::<String>())
+                                .unwrap_or_else(|| "?".to_string());
+                            push_toast(
+                                format!(
+                                    "✓ Submitted {bytes} bytes · id={id_short}… · lesson={lesson_id}"
+                                )
+                                .into(),
+                                cx,
+                            );
+                            // Refresh lesson-status badges in outline tree.
+                            let _ = workspace_weak.update_in(cx, |_, window, cx| {
+                                window.dispatch_action(Box::new(RefreshLessonStatus), cx);
+                            });
+                        }
+                        Err(e) => {
+                            breadcrumb("Submit", format!("FAILED: {e}"));
+                            push_toast(format!("Submit failed: {e}").into(), cx);
+                        }
                     }
                 })
                 .detach();
